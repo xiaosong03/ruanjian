@@ -1,0 +1,16 @@
+# 构建产物
+build/
+*.spec
+*.pyc
+__pycache__/
+*.egg-info/
+
+# 打包成品（需要时由源码重新打包；不纳入版本控制）
+dist*/
+
+# 生成输出与临时/测试产物
+_output*
+*.log.txt
+_t_*.docx
+_t_*.xlsx
+Untitled-*
