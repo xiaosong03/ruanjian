@@ -90,16 +90,29 @@ def _split_steps(step_text, exp_text):
 
 def _align_steps(role_text):
     """把各明细角色文本按换行拆成逐段并对齐。role_text: {角色: 全文}。
-    角色可取 step/expected/criterion/actual。返回 [{step,expected,criterion,...}]。"""
+    角色可取 step/expected/criterion/actual。返回 [{step,expected,criterion,...}]。
+
+    对齐规则（保证期望/实际与步骤严格一一对应，不推断、不编造）：
+      - 步骤(step)、期望(expected)、实际(actual)：严格按行号对齐，某角色行数不足则留空。
+      - 评价准则(criterion)：若只写一段（不含换行），视为整条用例统一准则，套用到所有步骤行。
+    """
     lines = {}
     for role, text in (role_text or {}).items():
-        lines[role] = [s.strip() for s in str(text).split('\n') if s.strip()]
-    n = max((len(v) for v in lines.values()), default=0)
+        arr = [s.strip() for s in str(text).replace('\r\n', '\n').replace('\r', '\n').split('\n')]
+        lines[role] = [s for s in arr if s]  # 去掉空段
+    # 行数以"步骤"为准；若无步骤列则取各角色最大行数
+    n = len(lines.get('step') or [])
+    if n == 0:
+        n = max((len(v) for v in lines.values()), default=0)
+    single_criterion = bool(lines.get('criterion')) and len(lines['criterion']) == 1
     steps = []
     for i in range(n):
         d = {}
         for role, arr in lines.items():
-            d[role] = arr[i] if i < len(arr) else ''
+            if role == 'criterion' and single_criterion:
+                d[role] = arr[0]  # 统一准则：套用到所有步骤行
+            else:
+                d[role] = arr[i] if i < len(arr) else ''
         steps.append(d)
     return steps
 
@@ -211,25 +224,32 @@ class App:
         ttk.Entry(frm, textvariable=self.xl_var, width=50).grid(row=3, column=1, sticky='we', **pad)
         ttk.Button(frm, text='浏览…', command=self._pick_xl).grid(row=3, column=2, **pad)
 
+        # ---- 公共步骤：界面写一次，自动插入到每个用例的步骤最前面（列随模板明细列动态生成） ----
+        self.csf = ttk.LabelFrame(
+            frm,
+            text=' 公共步骤（界面写一次，自动插入到每个用例的步骤最前面；列会随模板明细列自动变化） ',
+            padding=4)
+        self.csf.grid(row=4, column=0, columnspan=4, sticky='we', **pad)
+
         # ---- 输出文件 ----
-        ttk.Label(frm, text='输出 Word (*.docx):').grid(row=4, column=0, sticky='w', **pad)
+        ttk.Label(frm, text='输出 Word (*.docx):').grid(row=5, column=0, sticky='w', **pad)
         self.out_var = tk.StringVar(value=self._default_output())
-        ttk.Entry(frm, textvariable=self.out_var, width=50).grid(row=4, column=1, sticky='we', **pad)
-        ttk.Button(frm, text='浏览…', command=self._pick_out).grid(row=4, column=2, **pad)
+        ttk.Entry(frm, textvariable=self.out_var, width=50).grid(row=5, column=1, sticky='we', **pad)
+        ttk.Button(frm, text='浏览…', command=self._pick_out).grid(row=5, column=2, **pad)
 
         # ---- 预览信息 ----
         self.info = tk.StringVar(value='尚未识别模板。')
         ttk.Label(frm, textvariable=self.info, foreground='#2069c5').grid(
-            row=5, column=0, columnspan=4, sticky='w', **pad)
+            row=6, column=0, columnspan=4, sticky='w', **pad)
 
         # ---- 执行按钮 + 进度条 ----
         btnfrm = ttk.Frame(frm)
-        btnfrm.grid(row=6, column=0, columnspan=4, **pad)
+        btnfrm.grid(row=7, column=0, columnspan=4, **pad)
         self.gen_btn = ttk.Button(btnfrm, text='生成 Word 文档', command=self._generate)
         self.gen_btn.pack(side='left', padx=6)
         ttk.Button(btnfrm, text='退出', command=root.destroy).pack(side='left')
         self.progress = ttk.Progressbar(frm, mode='determinate', maximum=100)
-        self.progress.grid(row=7, column=0, columnspan=4, sticky='we', padx=8, pady=(0, 2))
+        self.progress.grid(row=8, column=0, columnspan=4, sticky='we', padx=8, pady=(0, 2))
 
         self.template_fields = []  # [{'label','key'}]
         self._meta = {}
@@ -271,6 +291,57 @@ class App:
         """默认输出文件名带时间戳，避免重跑覆盖上一版。"""
         return '_output_{}.docx'.format(datetime.now().strftime('%Y%m%d_%H%M%S'))
 
+    # 公共步骤面板：显示顺序 + 角色显示名
+    _COMMON_ROLE_DISPLAY = [('step', '步骤'), ('expected', '期望结果'),
+                            ('actual', '实际结果'), ('criterion', '评价准则')]
+
+    def _build_common_steps(self):
+        """按当前模板实际检测到的明细列重建公共步骤编辑栏。
+        只显示模板里真实存在的明细角色，避免写入无处可去的列。"""
+        for w in self.csf.winfo_children():
+            w.destroy()
+        self._common_txts = {}
+        roles = set()
+        for dc in self._meta.get('detail_cols', []) or []:
+            r = dc.get('role')
+            if r:
+                roles.add(r)
+        cols = [(r, d) for r, d in self._COMMON_ROLE_DISPLAY if r in roles]
+        if not cols:  # 连明细角色都没识别到时，退化为固定"步骤/期望"
+            cols = [('step', '步骤'), ('expected', '期望结果')]
+        for ci, (role, disp) in enumerate(cols):
+            sub = ttk.Frame(self.csf)
+            sub.grid(row=0, column=ci, sticky='nsew', padx=4, pady=2)
+            ttk.Label(sub, text=disp).pack(anchor='w')
+            txt = tk.Text(sub, height=3, width=28, wrap='word')
+            txt.pack(fill='both', expand=True)
+            self._common_txts[role] = txt
+            self.csf.columnconfigure(ci, weight=1)
+
+    def _load_common_steps(self):
+        """恢复当前模板自己记忆的公共步骤（按角色写回对应编辑框）。"""
+        _, cfg = load_template_config(self._tpl_source())
+        ps = cfg.get('public_steps') or {}
+        for role, txt in self._common_txts.items():
+            val = ps.get(role) or ''
+            txt.insert('1.0', val)
+
+    def _save_common_steps(self):
+        """把当前公共步骤按角色存到当前模板的配置（每个模板各自记忆，不互相串）。"""
+        try:
+            save_template_config(self._tpl_source(), {
+                'public_steps': {role: txt.get('1.0', 'end').strip()
+                                 for role, txt in self._common_txts.items()}
+            })
+        except Exception:
+            pass
+
+    def _common_steps_from_gui(self):
+        """把界面公共步骤解析为步骤行（各角色逐行与步骤对应；写一段的覆盖全部行）。
+        不同模板列不同，这里只取当前界面存在的角色。"""
+        return _align_steps({role: txt.get('1.0', 'end')
+                             for role, txt in self._common_txts.items()})
+
     def _pick_tpl(self):
         p = filedialog.askopenfilename(title='选择 Word 模板',
                                        filetypes=[('Word 文档', '*.docx'), ('所有文件', '*.*')])
@@ -291,6 +362,8 @@ class App:
         self._detail_role_vars.clear()
         self._excel_role_vars.clear()
         self._refresh_fields()
+        self._build_common_steps()   # 明细列随模板变化
+        self._load_common_steps()    # 恢复该模板自己的公共步骤
 
         label_list = '、'.join(f['label'] for f in fields) or '（无字段）'
         extra = f'（提示：{"；".join(warns[:3])}）' if warns else ''
@@ -489,6 +562,8 @@ class App:
             self._load_preview()
 
         iface = self._collect_interface()
+        common_steps = self._common_steps_from_gui()   # 界面公共步骤，插入每个用例最前
+        self._save_common_steps()                      # 记住本次填写的公共步骤
         name_label = next((f['label'] for f in self.template_fields
                            if _key_for_label(f['label']) == 'name'), None)
 
@@ -504,7 +579,8 @@ class App:
                 else:
                     ev = ((er or {}).get('fields') or {}).get(lbl, '') if er else ''
                     fields[lbl] = ev
-            steps = er['steps'] if er else []
+            # 私有步骤来自 Excel，公共步骤插到最前，两者按行一一对应
+            steps = common_steps + (er['steps'] if er else [])
             name = (fields.get(name_label) if name_label else '') or ('用例%d' % idx)
             cases.append({'name': name, 'fields': fields, 'steps': steps})
 

@@ -14,3 +14,6 @@ _output*
 _t_*.docx
 _t_*.xlsx
 Untitled-*
+
+# 工具/工作区元数据（不入库）
+.workbuddy/

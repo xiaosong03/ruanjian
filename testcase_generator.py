@@ -121,7 +121,7 @@ STEPS_COL_ALIASES = {
     'seq':      ['序号', '编号', '步骤编号'],
     'step':     ['测试步骤', '测试输入及测试步骤', '测试输入及步骤', '测试输入/步骤',
                  '测试输入', '输入及操作步骤', '步骤', '操作步骤'],
-    'expected': ['期望测试结果', '期望结果', '期望'],
+    'expected': ['期望测试结果', '期望结果', '预期结果', '期望', '预期'],
     'actual':   ['实际测试结果', '实际结果', '实际'],
     'criterion': ['评价准则', '评分准则', '评价标准', '评分标准', '评价'],
 }
@@ -329,9 +329,16 @@ def analyze_fields(tbl):
         data_trs = trs[header_index + 1:]
         anchor = None
         pattern = None
+        field_labels = {f['label'] for f in fields}
         for tr in data_trs:
             texts = [_tc_text(tc) for tc in _tr_tcs(tr)]
             if any(t in STOP_LABELS for t in texts):
+                anchor = tr
+                break
+            # 明细区结束：遇到模板字段行（如 测试人员/监测人员/备注 等）即停止，
+            # 避免把明细区下方的字段行当作"待清除的旧数据行"删掉。
+            nonempty = [t for t in texts if t]
+            if nonempty and nonempty[0] in field_labels:
                 anchor = tr
                 break
             st = header_cols.get('step')
