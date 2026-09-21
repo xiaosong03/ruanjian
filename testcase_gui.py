@@ -133,6 +133,30 @@ def _align_steps(role_text):
     return steps
 
 
+def _apply_placeholders(steps, fields):
+    """把步骤文本里的 {字段名} 占位符替换为该用例该字段的实际值。
+    - 只对含占位符的步骤生效，其余原样输出（零侵入）。
+    - 未匹配到对应字段值的占位符保持原文，避免误伤。
+    - 支持 步骤/期望/实际/准则 各角色。
+    """
+    repl = {f'{{{k}}}': str(v) for k, v in (fields or {}).items() if v}
+    if not repl:
+        return steps
+    out = []
+    for s in steps or []:
+        d = dict(s)
+        for role in ('step', 'expected', 'actual', 'criterion'):
+            v = d.get(role)
+            if not isinstance(v, str) or not v:
+                continue
+            for ph, val in repl.items():
+                if ph in v:
+                    v = v.replace(ph, val)
+            d[role] = v
+        out.append(d)
+    return out
+
+
 def load_cases_from_excel(path, field_labels, excel_map=None):
     """读取 Excel，返回 (cases, warnings)。
     cases: list[dict]，每项 {fields:{label:value}, steps:[{step,expected,criterion}]}。
@@ -610,6 +634,8 @@ class App:
                     fields[lbl] = ev
             # 私有步骤来自 Excel，公共步骤插到最前，两者按行一一对应
             steps = common_steps + (er['steps'] if er else [])
+            # 占位符替换：步骤/期望文本里的 {字段名} 换成该用例该字段的实际值
+            steps = _apply_placeholders(steps, fields)
             name = (fields.get(name_label) if name_label else '') or ('用例%d' % idx)
             cases.append({'name': name, 'fields': fields, 'steps': steps})
 
