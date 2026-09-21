@@ -180,25 +180,21 @@ def _style_run(r, text):
 
 
 def _set_tc_text(tc, text):
-    """设置某个 <w:tc> 内第一个段落第一个 run 的文本，字体统一为 宋体小五。"""
+    """设置某单元格为单段文本，字体统一为 宋体小五。
+    写入前清掉该格其它段落与 run，避免上一用例遗留的多行(JSON)内容残留在本格。"""
     paragraphs = tc.findall(qn('w:p'))
     if paragraphs:
+        for extra in paragraphs[1:]:
+            tc.remove(extra)
         p = paragraphs[0]
     else:
         p = tc.makeelement(qn('w:p'), {})
         tc.append(p)
-    runs = p.findall(qn('w:r'))
+    for r in p.findall(qn('w:r')):
+        p.remove(r)
     if not text:
-        for r in runs:
-            p.remove(r)
         return
-    if runs:
-        r = runs[0]
-        for extra in runs[1:]:
-            p.remove(extra)
-    else:
-        r = p.makeelement(qn('w:r'), {})
-        p.append(r)
+    r = p.makeelement(qn('w:r'), {})
     _style_run(r, text)
     p.append(r)
 
@@ -237,6 +233,28 @@ def _put_tc(tc, text):
         _set_tc_lines(tc, text)
     else:
         _set_tc_text(tc, text)
+
+
+def _is_json(text):
+    """一段文本能否解析为合法 JSON。"""
+    s = str(text).strip()
+    if not s:
+        return False
+    try:
+        json.loads(s)
+        return True
+    except Exception:
+        return False
+
+
+def _prettify_json(text):
+    """合法 JSON 重排为缩进多行便于阅读；否则原样返回。"""
+    if not _is_json(text):
+        return text
+    try:
+        return json.dumps(json.loads(text), ensure_ascii=False, indent=2)
+    except Exception:
+        return text
 
 
 def _is_field_label(text):
@@ -484,7 +502,7 @@ def _fill_detail(tbl, info, data, config=None):
                             ('actual', 'actual'), ('criterion', 'criterion')):
             c = cell(role)
             if c is not None:
-                _set_tc_text(c, st.get(field, ''))
+                _put_tc(c, _prettify_json(st.get(field, '')))
 
 
 # ---------------------------------------------------------------------------

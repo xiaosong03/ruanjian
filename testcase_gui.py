@@ -4,6 +4,7 @@
 - 未填写的字段从 Excel 读取，按第一行表头匹配模板字段，一行 = 一个用例
 - 界面优先：界面有值的字段用界面值，界面未填才用 Excel
 """
+import json
 import os
 import threading
 import tkinter as tk
@@ -88,6 +89,17 @@ def _split_steps(step_text, exp_text):
     return steps
 
 
+def _is_json_text(text):
+    """一段文本能否解析为合法 JSON（含整段多行）。"""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        json.loads(text)
+        return True
+    except Exception:
+        return False
+
+
 def _align_steps(role_text):
     """把各明细角色文本按换行拆成逐段并对齐。role_text: {角色: 全文}。
     角色可取 step/expected/criterion/actual。返回 [{step,expected,criterion,...}]。
@@ -98,8 +110,12 @@ def _align_steps(role_text):
     """
     lines = {}
     for role, text in (role_text or {}).items():
-        arr = [s.strip() for s in str(text).replace('\r\n', '\n').replace('\r', '\n').split('\n')]
-        lines[role] = [s for s in arr if s]  # 去掉空段
+        raw = str(text).replace('\r\n', '\n').replace('\r', '\n')
+        # JSON 内容视为一个原子值（不按换行拆散），避免多行 JSON 被拆成多步错位
+        if _is_json_text(raw):
+            lines[role] = [raw.strip()]
+        else:
+            lines[role] = [s.strip() for s in raw.split('\n') if s.strip()]
     # 行数以"步骤"为准；若无步骤列则取各角色最大行数
     n = len(lines.get('step') or [])
     if n == 0:
@@ -390,11 +406,22 @@ class App:
             row=0, column=1, sticky='w', padx=6, pady=(2, 2))
         self.field_frame.columnconfigure(1, weight=1)
 
+        # 当前已导入 Excel 中已提供数据的字段（界面可不填，生成时自动使用 Excel 值）
+        excel_have = set()
+        for er in (self._excel_rows or []):
+            for lbl, val in (er.get('fields') or {}).items():
+                if val:
+                    excel_have.add(lbl)
+
         for ri, f in enumerate(self.template_fields, start=1):
             label = f['label']
             key = f.get('key')
             ttk.Label(self.field_frame, text=f'{label}:').grid(
                 row=ri, column=0, sticky='nw', padx=6, pady=2)
+            if label in excel_have:
+                ttk.Label(self.field_frame, text='←Excel有，可不填',
+                          foreground='#2e7d32').grid(
+                    row=ri, column=2, sticky='nw', padx=(2, 6), pady=2)
             prev = saved.get(label, '')
             if key in MULTI_KEYS:
                 txt = tk.Text(self.field_frame, width=66, height=2, wrap='word')
@@ -564,6 +591,8 @@ class App:
         iface = self._collect_interface()
         common_steps = self._common_steps_from_gui()   # 界面公共步骤，插入每个用例最前
         self._save_common_steps()                      # 记住本次填写的公共步骤
+        if common_steps:
+            self.info.set('提示：公共步骤有 {} 条，将自动插入到每个用例的最前面。'.format(len(common_steps)))
         name_label = next((f['label'] for f in self.template_fields
                            if _key_for_label(f['label']) == 'name'), None)
 
@@ -640,6 +669,14 @@ class App:
             lines.append('用例数量：{}'.format(len(cases)))
             total_steps = sum(len(c['steps']) for c in cases)
             lines.append('测试步骤总数：{}'.format(total_steps))
+            try:
+                cs = self._common_steps_from_gui()
+                if cs:
+                    lines.append('公共步骤：{} 条（已插入每个用例最前）'.format(len(cs)))
+                else:
+                    lines.append('公共步骤：无')
+            except Exception:
+                pass
             lines.append('')
             lines.append('---- Excel 表头匹配情况 ----')
             headers = self._last_excel_headers
