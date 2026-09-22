@@ -235,24 +235,43 @@ def _put_tc(tc, text):
         _set_tc_text(tc, text)
 
 
-def _is_json(text):
-    """一段文本能否解析为合法 JSON。"""
+def _json_stream(text):
+    """把一个单元格文本当作"JSON 流"解析：允许一个或多个 JSON 值拼接。
+    例如两个对象连写 {"a":1}{"b":2} 仍视为一段合法 JSON（原子块）。
+    返回 list[解析出的值]；无法整体解析（含多余非 JSON 杂质）时返回 None。"""
     s = str(text).strip()
     if not s:
-        return False
-    try:
-        json.loads(s)
-        return True
-    except Exception:
-        return False
+        return None
+    decoder = json.JSONDecoder()
+    idx, n = 0, len(s)
+    vals = []
+    while idx < n:
+        while idx < n and s[idx] in ' \t\r\n':
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            obj, end = decoder.raw_decode(s, idx)
+        except ValueError:
+            return None
+        vals.append(obj)
+        idx = end
+    return vals if vals else None
+
+
+def _is_json(text):
+    """一段文本能否解析为合法 JSON（含一个或多个 JSON 值拼接成的 JSON 流）。"""
+    return _json_stream(text) is not None
 
 
 def _prettify_json(text):
-    """合法 JSON 重排为缩进多行便于阅读；否则原样返回。"""
-    if not _is_json(text):
+    """合法 JSON（含拼接流）重排为缩进多行便于阅读；否则原样返回。"""
+    vals = _json_stream(text)
+    if vals is None:
         return text
     try:
-        return json.dumps(json.loads(text), ensure_ascii=False, indent=2)
+        parts = [json.dumps(v, ensure_ascii=False, indent=2) for v in vals]
+        return '\n'.join(parts)
     except Exception:
         return text
 
@@ -613,6 +632,78 @@ def _ensure_caption_style(doc):
 
 
 # ---------------------------------------------------------------------------
+# 需求覆盖率追踪矩阵
+# ---------------------------------------------------------------------------
+def _build_trace_matrix(cases):
+    """需求覆盖率追踪矩阵：需求号 -> 用例标识清单。
+    依据语义 key=trace 的字段聚合其下所有用例标识(case_id，缺省用用例名)。
+    返回 [(需求号, 用例标识清单), ...]；无 trace 字段或没有有效需求号时返回 None。"""
+    trace_label = None
+    caseid_label = None
+    for c in cases:
+        for k in (c.get('fields') or {}):
+            kk = _key_for_label(k)
+            if kk == 'trace' and trace_label is None:
+                trace_label = k
+            elif kk == 'case_id' and caseid_label is None:
+                caseid_label = k
+    if trace_label is None:
+        return None
+    order = []
+    seen_map = {}
+    for c in cases:
+        tr = ((c.get('fields') or {}).get(trace_label) or '').strip()
+        if not tr:
+            continue
+        cid = ((c.get('fields') or {}).get(caseid_label) if caseid_label else '') \
+            or (c.get('name') or '').strip()
+        if not cid:
+            continue
+        if tr not in seen_map:
+            seen_map[tr] = []
+            order.append(tr)
+        if cid not in seen_map[tr]:
+            seen_map[tr].append(cid)
+    if not order:
+        return None
+    return [[tr, '、'.join(seen_map[tr])] for tr in order]
+
+
+def _append_trace_matrix(doc, prev, rows, cap_num, id_h4, id_cap):
+    """在最后一个用例表之后追加：追踪矩阵标题 + 题注表标题 + 两张带边框表格。"""
+    mh = _make_heading('需求覆盖率追踪矩阵', id_h4)
+    prev.addnext(mh)
+    prev = mh
+    mcap = _make_caption(cap_num, '需求覆盖率追踪矩阵', id_cap)
+    prev.addnext(mcap)
+    prev = mcap
+    tbl = doc.add_table(rows=len(rows) + 1, cols=2)
+    borders = ('<w:tblBorders %s><w:top w:val="single" w:sz="4" w:color="auto"/>'
+               '<w:left w:val="single" w:sz="4" w:color="auto"/>'
+               '<w:bottom w:val="single" w:sz="4" w:color="auto"/>'
+               '<w:right w:val="single" w:sz="4" w:color="auto"/>'
+               '<w:insideH w:val="single" w:sz="4" w:color="auto"/>'
+               '<w:insideV w:val="single" w:sz="4" w:color="auto"/></w:tblBorders>'
+               ) % nsdecls('w')
+    tblPr = tbl._tbl.tblPr
+    tblPr.append(parse_xml(borders))
+    prev.addnext(tbl._tbl)
+    prev = tbl._tbl
+
+    def setcell(r, c, text):
+        cell = tbl.cell(r, c)
+        run = cell.paragraphs[0].add_run(text)
+        _style_run(run._r, text)
+
+    setcell(0, 0, '需求号')
+    setcell(0, 1, '用例标识清单')
+    for i, (tr, ids) in enumerate(rows, start=1):
+        setcell(i, 0, tr)
+        setcell(i, 1, ids)
+    return prev
+
+
+# ---------------------------------------------------------------------------
 # 文档装配：多用例 -> 同一 Word
 # ---------------------------------------------------------------------------
 def generate_document(output_path, cases, template_source=None, h3_title='功能测试',
@@ -665,6 +756,11 @@ def generate_document(output_path, cases, template_source=None, h3_title='功能
                 progress_cb(i + 1, len(cases))
             except Exception:
                 pass
+
+    # 需求覆盖率追踪矩阵：需求号 -> 用例标识清单（文档末尾）
+    matrix_rows = _build_trace_matrix(cases)
+    if matrix_rows is not None:
+        _append_trace_matrix(doc, prev, matrix_rows, len(cases) + 1, id_h4, id_cap)
 
     doc.save(output_path)
     close_doc(doc)

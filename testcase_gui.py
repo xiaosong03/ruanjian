@@ -14,7 +14,7 @@ from tkinter import filedialog, messagebox, ttk
 import openpyxl
 
 from testcase_generator import (ALIAS_GROUPS, STEPS_COL_ALIASES,
-                                _key_for_label, generate_document,
+                                _json_stream, _key_for_label, generate_document,
                                 get_template_fields, load_template_config,
                                 save_template_config)
 
@@ -90,14 +90,10 @@ def _split_steps(step_text, exp_text):
 
 
 def _is_json_text(text):
-    """一段文本能否解析为合法 JSON（含整段多行）。"""
+    """一段文本是否可解析为 JSON 流（含单个或多个拼接的 JSON 值，整段多行）。"""
     if not isinstance(text, str) or not text.strip():
         return False
-    try:
-        json.loads(text)
-        return True
-    except Exception:
-        return False
+    return _json_stream(text) is not None
 
 
 def _align_steps(role_text):
@@ -131,6 +127,65 @@ def _align_steps(role_text):
                 d[role] = arr[i] if i < len(arr) else ''
         steps.append(d)
     return steps
+
+
+def _case_warnings(cases):
+    """生成前用例级一致性检查（不阻断生成）。
+    返回 (dup_lines, align_lines)：
+      - dup:    重复的测试用例标识；
+      - align:  步骤数与期望结果/实际结果/评价准则行数不一致（错位风险）。"""
+    dup_lines = []
+    seen = {}
+    for c in cases:
+        cid_label = next((k for k in (c.get('fields') or {})
+                          if _key_for_label(k) == 'case_id'), None)
+        cid = ((c.get('fields') or {}).get(cid_label) if cid_label else '') \
+            or (c.get('name') or '').strip()
+        if not cid:
+            continue
+        if cid in seen:
+            dup_lines.append('重复用例标识“{}”：见“{}”与“{}”'.format(cid, seen[cid], c['name']))
+        else:
+            seen[cid] = c['name']
+
+    align_lines = []
+    # 期望/实际/准则 都参与；仅在"真正配对错位"时告警：
+    # 某一行一侧有内容、另一侧为空、而更后面那一侧又有内容（内容被空行错位顶跑）。
+    # 仅末尾自然没有内容的行（如最后一个步骤无期望结果）不算问题。
+    _ROLE_DISP = {'expected': '期望结果', 'actual': '实际结果', 'criterion': '评价准则'}
+    for c in cases:
+        steps = c.get('steps') or []
+        for role, disp in _ROLE_DISP.items():
+            has_step = [bool((s.get('step') or '').strip()) for s in steps]
+            has_role = [bool((s.get(role) or '').strip()) for s in steps]
+            if len(has_step) != len(has_role):
+                has_role = has_role + [False] * (len(has_step) - len(has_role))
+            misaligned = False
+            for i in range(len(steps)):
+                if has_step[i] and not has_role[i] and any(v for v in has_role[i + 1:]):
+                    misaligned = True
+                    break
+                if has_role[i] and not has_step[i] and any(v for v in has_step[i + 1:]):
+                    misaligned = True
+                    break
+            if misaligned:
+                align_lines.append('用例“{}”：步骤与{}存在漏填/错位（同一行一侧有内容、另一侧为空，但后续行又有该列内容）'
+                                   .format(c['name'], disp))
+    return dup_lines, align_lines
+
+
+def _write_warn_txt(out, warns):
+    """把警告清单写到 <输出基名>.warn.txt；返回清单文本（无警告则 None）。"""
+    if not warns:
+        return None
+    base, _ = os.path.splitext(out)
+    path = base + '.warn.txt'
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(warns))
+    except Exception:
+        path = None
+    return '\n'.join(warns) + ('\n\n警告清单已存：' + path if path else '')
 
 
 def _apply_placeholders(steps, fields):
@@ -287,6 +342,7 @@ class App:
         btnfrm.grid(row=7, column=0, columnspan=4, **pad)
         self.gen_btn = ttk.Button(btnfrm, text='生成 Word 文档', command=self._generate)
         self.gen_btn.pack(side='left', padx=6)
+        ttk.Button(btnfrm, text='批量生成…', command=self._open_batch).pack(side='left', padx=6)
         ttk.Button(btnfrm, text='退出', command=root.destroy).pack(side='left')
         self.progress = ttk.Progressbar(frm, mode='determinate', maximum=100)
         self.progress.grid(row=8, column=0, columnspan=4, sticky='we', padx=8, pady=(0, 2))
@@ -605,6 +661,39 @@ class App:
             self._excel_rows = None
             self.info.set(f'Excel 导入失败：{e}')
 
+    # ---------- 空字段预检 ----------
+    # 提示语无需改名；关键字段（名称/标识）为空时输出易混淆，其它为空仅提示。
+    def _precheck_cases(self, cases):
+        """统计各用例中"将为空"的字段（界面未填、Excel 也没有）。
+        返回 (critical, others)：{字段label: 出现个数}。"""
+        critical = {}
+        others = {}
+        for c in (cases or []):
+            for lbl, v in (c.get('fields') or {}).items():
+                if v:
+                    continue
+                if _key_for_label(lbl) in ('name', 'case_id'):
+                    critical[lbl] = critical.get(lbl, 0) + 1
+                else:
+                    others[lbl] = others.get(lbl, 0) + 1
+        return critical, others
+
+    def _precheck_confirm(self, cases, title_suffix=''):
+        """生成前空字段预检：有字段将为空时列清单询问是否继续。返回 True=继续。"""
+        critical, others = self._precheck_cases(cases)
+        if not critical and not others:
+            return True
+        parts = []
+        if critical:
+            detail = '；'.join('{}：{}个'.format(l, n) for l, n in critical.items())
+            parts.append('【关键必填缺失，输出后易混淆】' + detail)
+        if others:
+            detail = '；'.join('{}：{}个'.format(l, n) for l, n in others.items())
+            parts.append('【其它字段留空】' + detail)
+        msg = '\n\n'.join(parts) + '\n\n仍继续生成吗？（选“否”可先回填再生成）'
+        title = '空字段预检' + title_suffix
+        return bool(messagebox.askyesno(title, msg))
+
     def _generate(self):
         if not self.template_fields:
             messagebox.showwarning('提示', '请先识别模板字段。')
@@ -644,17 +733,15 @@ class App:
             messagebox.showwarning('提示', '请指定输出文件路径。')
             return
 
-        # ---- 必填校验（Feature2）：用例名称字段为空的用例需用户确认 ----
-        if name_label:
-            missing = [c for c in cases if not (c['fields'].get(name_label) or '').strip()]
-        else:
-            missing = [c for c in cases if not (c.get('name') or '').strip()]
-        if missing:
-            if not messagebox.askyesno(
-                    '完整性校验',
-                    '有 {} 个用例的"用例名称"为空，输出后难以区分。\n\n'
-                    '仍继续生成吗？（选"否"可先回填名称）'.format(len(missing))):
-                return
+        # ---- 用例级一致性警告（重复标识/步骤期望错位），只提示不阻断 ----
+        dup_w, al_w = _case_warnings(cases)
+        warn_text = _write_warn_txt(out, dup_w + al_w)
+        if warn_text:
+            messagebox.showwarning('生成警告', warn_text + '\n\n仍将继续生成。')
+
+        # ---- 空字段预检：界面未填、Excel 也没有的字段提前暴露，避免生成后返工 ----
+        if not self._precheck_confirm(cases):
+            return
 
         src = self._tpl_source()
         h3_title = self.h3_var.get().strip() or '功能测试'
@@ -746,6 +833,321 @@ class App:
             messagebox.showinfo('完成', text)
         else:
             messagebox.showerror('错误', msg)
+
+    # ---------- 批量多模板（最简版） ----------
+    def _open_batch(self):
+        BatchWindow(self)
+
+    def _gen_task_cases(self, src, xl, iface, common_steps):
+        """针对单个批量任务构造用例。模板字段来自该任务自身模板；
+        公共字段/公共步骤沿用主窗口（第一次任务）填的作为默认。"""
+        fields_list, _meta, _warns = get_template_fields(src)
+        if not fields_list:
+            raise RuntimeError('模板未识别到字段。')
+        _, tcfg = load_template_config(src)
+        labels = [f['label'] for f in fields_list]
+        rows, _w, _h = load_cases_from_excel(xl, labels, tcfg.get('excel_col_map'))
+        name_label = next((f['label'] for f in fields_list
+                           if _key_for_label(f['label']) == 'name'), None)
+        cases = []
+        for idx, er in enumerate(rows, start=1):
+            fields = {}
+            for f in fields_list:
+                lbl = f['label']
+                ival = iface.get(lbl, '')
+                fields[lbl] = ival if ival else ((er or {}).get('fields') or {}).get(lbl, '')
+            steps = common_steps + (er['steps'] if er else [])
+            steps = _apply_placeholders(steps, fields)
+            name = (fields.get(name_label) if name_label else '') or ('用例%d' % idx)
+            cases.append({'name': name, 'fields': fields, 'steps': steps})
+        return cases
+
+
+class BatchWindow:
+    """批量生成（最简版）：可添加去重多个"模板+Excel+输出名"任务，
+    公共字段/公共步骤沿用主窗口（第一次任务）填的作为默认。"""
+
+    def __init__(self, app):
+        self.app = app
+        self.root = tk.Toplevel(app.root)
+        self.root.title('批量生成（多模板）')
+        self.root.geometry('780x420')
+        self.root.transient(app.root)
+
+        pad = {'padx': 6, 'pady': 4}
+        frm = ttk.Frame(self.root, padding=8)
+        frm.pack(fill='both', expand=True)
+
+        cols = ('tpl', 'xl', 'out')
+        self.tree = ttk.Treeview(frm, columns=cols, show='headings', height=10)
+        for c, t, w in (('tpl', 'Word 模板', 250),
+                        ('xl', 'Excel', 230),
+                        ('out', '输出 .docx', 240)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor='w')
+        self.tree.pack(fill='both', expand=True, **pad)
+        self.tasks = []  # [{'src','xl','out',
+                         #    'fields':[{'label','key'}],  # 该任务模板自己的字段
+                         #    'meta': detail cols ...
+                         #    'override': {'fields':{label:val}, 'public_steps':{role:raw}, 'configured':bool}}]
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill='x', **pad)
+        ttk.Button(btns, text='添加任务', command=self._add).pack(side='left', padx=4)
+        ttk.Button(btns, text='补填…', command=self._edit).pack(side='left', padx=4)
+        ttk.Button(btns, text='删除所选', command=self._remove).pack(side='left', padx=4)
+        ttk.Button(btns, text='清除', command=self._clear).pack(side='left', padx=4)
+        self.run_btn = ttk.Button(btns, text='生成全部', command=self._generate_all)
+        self.run_btn.pack(side='right', padx=4)
+
+        self.status = tk.StringVar(value='已添加 0 个任务')
+        ttk.Label(frm, textvariable=self.status, foreground='#2069c5').pack(anchor='w', **pad)
+        self.progress = ttk.Progressbar(frm, mode='determinate', maximum=100)
+        self.progress.pack(fill='x', padx=6, pady=(0, 2))
+
+    def _add(self):
+        src = filedialog.askopenfilename(title='选择 Word 模板',
+                                         filetypes=[('Word 文档', '*.docx'), ('所有文件', '*.*')])
+        if not src:
+            return
+        xl = filedialog.askopenfilename(title='选择 Excel 数据文件',
+                                        filetypes=[('Excel 工作簿', '*.xlsx'), ('所有文件', '*.*')])
+        if not xl:
+            return
+        default_out = os.path.join(os.path.dirname(xl) or '.', self.app._default_output())
+        out = filedialog.asksaveasfilename(title='保存输出文档', defaultextension='.docx',
+                                           filetypes=[('Word 文档', '*.docx')],
+                                           initialdir=os.path.dirname(default_out),
+                                           initialfile=os.path.basename(default_out))
+        if not out:
+            return
+        # 去重：相同 模板+Excel+输出名 不重复添加
+        for t in self.tasks:
+            if (os.path.normpath(t['src']), os.path.normpath(t['xl']), os.path.normpath(t['out'])) == \
+               (os.path.normpath(src), os.path.normpath(xl), os.path.normpath(out)):
+                messagebox.showwarning('提示', '该任务已存在（模板/Excel/输出名均相同）。')
+                return
+        try:
+            fields_list, meta, _w = get_template_fields(src)
+        except Exception as e:
+            messagebox.showerror('模板读取失败', str(e))
+            return
+        self.tasks.append({'src': src, 'xl': xl, 'out': out,
+                           'fields': fields_list, 'meta': meta,
+                           'override': {'fields': {}, 'public_steps': {},
+                                        'configured': False}})
+        self.tree.insert('', 'end',
+                         values=(os.path.basename(src), os.path.basename(xl), out))
+        self.status.set('已添加 {} 个任务'.format(len(self.tasks)))
+
+    def _edit(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning('提示', '请先选择要补填的任务。')
+            return
+        idx = self.tree.index(sel[0])
+        TaskEditDialog(self, self.tasks[idx])
+
+    def _remove(self):
+        for iid in self.tree.selection():
+            idx = self.tree.index(iid)
+            del self.tasks[idx]
+            self.tree.delete(iid)
+        self.status.set('已添加 {} 个任务'.format(len(self.tasks)))
+
+    def _clear(self):
+        self.tasks.clear()
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        self.status.set('已添加 0 个任务')
+
+    def _generate_all(self):
+        if not self.tasks:
+            messagebox.showwarning('提示', '请先添加任务。')
+            return
+        main_iface = self.app._collect_interface()            # 主窗口公共字段
+        main_steps = self.app._common_steps_from_gui()         # 公共步骤默认沿用
+        # 主线程先构建各任务用例，做空字段预检（弹窗确认后再启动生成线程）
+        plan = []        # [(task, cases)]
+        prep_fail = []   # (task, errmsg)
+        warn_n = 0       # 有警告的任务数
+        for t in self.tasks:
+            try:
+                task_iface = dict(main_iface)
+                task_iface.update(t['override']['fields'])
+                cs = _align_steps(t['override']['public_steps']) if t['override'].get('configured') else main_steps
+                cs_this = self.app._gen_task_cases(t['src'], t['xl'], task_iface, cs)
+                plan.append((t, cs_this))
+                # 用例级警告：该任务重复标识/步骤期望错位，写 warn.txt，不阻断
+                dup_w, al_w = _case_warnings(cs_this)
+                if _write_warn_txt(t['out'], dup_w + al_w):
+                    warn_n += 1
+            except Exception as e:
+                prep_fail.append((t, str(e)))
+        if not plan:
+            if prep_fail:
+                self._finish([(os.path.basename(t['src']), False, m) for t, m in prep_fail])
+            else:
+                messagebox.showwarning('提示', '没有可生成的任务。')
+            return
+        all_cases = [c for _t, cs in plan for c in cs]
+        if not self.app._precheck_confirm(all_cases, '（批量）'):
+            return
+
+        self.run_btn.config(state='disabled')
+        self.progress.config(value=0)
+        total = len(plan)
+        results = prep_fail and [(os.path.basename(t['src']), False, m) for t, m in prep_fail] or []
+        results = list(results)
+
+        def work():
+            for i, (t, cases) in enumerate(plan, start=1):
+                try:
+                    generate_document(t['out'], cases, template_source=t['src'],
+                                      h3_title=self.app.h3_var.get().strip() or '功能测试')
+                    results.append((os.path.basename(t['src']), True, '成功，{} 个用例'.format(len(cases))))
+                except Exception as e:
+                    results.append((os.path.basename(t['src']), False, str(e)))
+                self.root.after(0, lambda d=i: self.progress.config(value=d / total * 100))
+            self.root.after(0, lambda: self._finish(results, warn_n))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish(self, results, warn_n=0):
+        self.run_btn.config(state='normal')
+        self.progress.config(value=100)
+        ok_n = sum(1 for _, ok, _ in results if ok)
+        fail = [(n, m) for n, _ok, m in results if not _ok]
+        self.status.set('成功 {} / {}，失败 {}'.format(ok_n, len(results), len(fail)))
+        warn_part = '；{} 个任务有警告（已存 .warn.txt）'.format(warn_n) if warn_n else ''
+        err_path = None
+        if fail:
+            # 失败明细同时写入一份错误 txt，便于排查
+            try:
+                base_dir = (os.path.dirname(os.path.abspath(self.tasks[0]['out']))
+                            if getattr(self, 'tasks', None) else os.getcwd())
+                err_path = os.path.join(
+                    base_dir, '批量生成错误_{}.txt'.format(datetime.now().strftime('%Y%m%d_%H%M%S')))
+                with open(err_path, 'w', encoding='utf-8') as f:
+                    f.write('批量生成 - 失败明细\n生成时间：{}\n\n'.format(
+                        datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+                    for n, m in fail:
+                        f.write('【{}】\n{}\n\n'.format(n, m))
+            except Exception:
+                err_path = None
+            msg = '\n'.join('{}：{}'.format(n, m) for n, m in fail)
+            if err_path:
+                msg += '\n\n失败清单已存：{}'.format(err_path)
+            messagebox.showwarning('批量生成完成',
+                                   '成功 {} 份，失败 {} 份{}。\n\n失败明细：\n{}'.format(
+                                       ok_n, len(fail), warn_part, msg))
+        else:
+            messagebox.showinfo('批量生成完成',
+                                '全部成功：{} 份文档已生成{}。'.format(ok_n, warn_part))
+
+
+class TaskEditDialog:
+    """单个批量任务的公共参数补填：默认沿用主窗口（第一次任务）的值，
+    可补填该任务模板特有的字段与公共步骤；保存后该任务单独使用。"""
+
+    _ROLE_DISP = [('step', '步骤'), ('expected', '期望结果'),
+                  ('actual', '实际结果'), ('criterion', '评价准则')]
+
+    def __init__(self, batch, task):
+        self.batch = batch
+        self.task = task
+        app = batch.app
+        ov = task['override']
+
+        root = tk.Toplevel(batch.root)
+        self.root = root
+        root.title('补填公共参数 - ' + os.path.basename(task['src']))
+        root.geometry('660x540')
+        root.transient(batch.root)
+
+        outer = ttk.Frame(root, padding=8)
+        outer.pack(fill='both', expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        win = canvas.create_window((0, 0), window=inner, anchor='nw')
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        vsb.pack(side='right', fill='y')
+        inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfigure(win, width=e.width))
+        canvas.bind_all('<MouseWheel>', lambda e: canvas.yview_scroll(int(-e.delta / 120), 'units'))
+
+        frm = ttk.LabelFrame(inner, text=' 公共字段（默认沿用主窗口，可在此补填/修改） ', padding=4)
+        frm.grid(sticky='we', padx=4, pady=4)
+        main_iface = app._collect_interface()
+        self.field_vars = {}
+        for ri, f in enumerate(task['fields']):
+            label = f['label']
+            init = ov['fields'].get(label)
+            if init is None:
+                init = main_iface.get(label, '')
+            ttk.Label(frm, text='{}:'.format(label)).grid(
+                row=ri, column=0, sticky='nw', padx=4, pady=2)
+            if f.get('key') in MULTI_KEYS:
+                t = tk.Text(frm, width=60, height=2, wrap='word')
+                t.grid(row=ri, column=1, sticky='we', padx=4, pady=2)
+                if init:
+                    t.insert('1.0', init)
+                self.field_vars[label] = t
+            else:
+                v = tk.StringVar(value=init)
+                ttk.Entry(frm, textvariable=v, width=70).grid(
+                    row=ri, column=1, sticky='we', padx=4, pady=2)
+                self.field_vars[label] = v
+            frm.columnconfigure(1, weight=1)
+
+        # ---- 公共步骤区（按该任务模板实际存在的明细列显示） ----
+        self.step_txts = {}
+        roles = set((dc.get('role') for dc in task['meta'].get('detail_cols', []) if dc.get('role')))
+        cols = [(r, d) for r, d in self._ROLE_DISP if r in roles]
+        if not cols:
+            cols = [('step', '步骤'), ('expected', '期望结果')]
+        sfrm = ttk.LabelFrame(
+            inner, text=' 公共步骤（默认沿用主窗口；写一次插入每个用例步骤最前；可留空表示该任务无公共步骤） ',
+            padding=4)
+        sfrm.grid(sticky='we', padx=4, pady=4)
+        main_txts = app._common_txts
+        used_steps = ov['public_steps'] if ov.get('configured') else {}
+        for ci, (role, disp) in enumerate(cols):
+            sub = ttk.Frame(sfrm)
+            sub.grid(row=0, column=ci, sticky='nsew', padx=4, pady=2)
+            ttk.Label(sub, text=disp).pack(anchor='w')
+            t = tk.Text(sub, height=4, width=30, wrap='word')
+            init = used_steps.get(role)
+            if init is None and role in main_txts:
+                init = main_txts[role].get('1.0', 'end').strip()
+            if init:
+                t.insert('1.0', init)
+            t.pack(fill='both', expand=True)
+            self.step_txts[role] = t
+            sfrm.columnconfigure(ci, weight=1)
+
+        btns = ttk.Frame(inner)
+        btns.grid(sticky='we', padx=4, pady=6)
+        ttk.Button(btns, text='保存并用于该任务', command=self._save).pack(side='left', padx=4)
+        ttk.Button(btns, text='取消', command=root.destroy).pack(side='left', padx=4)
+
+    def _save(self):
+        ov = self.task['override']
+        fields = {}
+        for label, w in self.field_vars.items():
+            if isinstance(w, tk.Text):
+                fields[label] = w.get('1.0', 'end').strip()
+            else:
+                fields[label] = w.get().strip()
+        ov['fields'] = fields
+        ov['public_steps'] = {role: t.get('1.0', 'end').strip()
+                              for role, t in self.step_txts.items()}
+        ov['configured'] = True
+        self.batch.status.set('已添加 {} 个任务（含补填）'.format(len(self.batch.tasks)))
+        self.root.destroy()
 
 
 def main():
