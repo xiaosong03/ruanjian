@@ -1,13 +1,13 @@
 {
   "info": {
     "_postman_id": "4f8a1c01-2b61-4a14-9d9e-abc123456789",
-    "name": "初始化_001",
+    "name": "初始",
     "description": "用于测试“灌入 Postman JSON”功能，含嵌套文件夹与多接口。",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
     {
-      "name": "初始化_001",
+      "name": "初始化",
       "request": {
         "method": "GET",
         "url": "https://api.example.com/config?id=1",
@@ -35,7 +35,7 @@
           }
         },
         {
-          "name": "查询设备列表",
+          "name": "查询_002",
           "request": {
             "method": "POST",
             "url": "https://api.example.com/device/list",
@@ -51,10 +51,10 @@
       ]
     },
     {
-      "name": "系统维护",
+      "name": "查询_003",
       "item": [
         {
-          "name": "设备重启",
+          "name": "查询_003",
           "request": {
             "method": "POST",
             "url": "https://api.example.com/system/reboot",

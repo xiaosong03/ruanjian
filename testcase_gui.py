@@ -1102,8 +1102,8 @@ class PostmanInjectDialog:
 
     def _build(self, root):
         win = tk.Toplevel(root)
-        win.title('灌入 Postman JSON · 单接口')
-        win.geometry('560x300')
+        win.title('灌入 Postman JSON · 多接口')
+        win.geometry('620x420')
         win.resizable(False, False)
         win.transient(root)
         win.grab_set()
@@ -1127,13 +1127,18 @@ class PostmanInjectDialog:
         ttk.Button(frm, text='浏览…', command=self._pick_fill).grid(row=2, column=2, **pad)
         ttk.Label(frm, text='列：测试用例名称 / 预期结果 / 实际结果').grid(row=3, column=1, sticky='w', **pad)
 
-        ttk.Label(frm, text='接口（按名称匹配用例）:').grid(row=4, column=0, sticky='w', **pad)
-        self.names = ttk.Combobox(frm, state='readonly', width=46)
-        self.names.grid(row=4, column=1, sticky='we', **pad)
-        ttk.Label(frm, text='（下拉选择单个接口）').grid(row=4, column=2, sticky='w', **pad)
+        ttk.Label(frm, text='接口（按名称匹配用例）:').grid(row=4, column=0, rowspan=6, sticky='nw', **pad)
+        lb = tk.Listbox(frm, selectmode='multiple', height=10, width=46)
+        lb.grid(row=4, column=1, rowspan=6, sticky='nsew', **pad)
+        sc = ttk.Scrollbar(frm, orient='vertical', command=lb.yview)
+        sc.grid(row=4, column=2, rowspan=6, sticky='ns')
+        lb.config(yscrollcommand=sc.set)
+        self.lb = lb
+        ttk.Label(frm, text='（可多选，Ctrl/Shift 点选）').grid(row=10, column=1, sticky='w', **pad)
+        ttk.Label(frm, text='文件名若重复可直接覆盖同一文档').grid(row=11, column=1, sticky='w', **pad)
 
         btn = ttk.Button(frm, text='灌入所选接口', command=lambda: self._run(win))
-        btn.grid(row=5, column=1, sticky='we', **pad)
+        btn.grid(row=12, column=1, sticky='we', **pad)
 
         frm.columnconfigure(1, weight=1)
 
@@ -1158,9 +1163,9 @@ class PostmanInjectDialog:
             messagebox.showwarning('未找到接口', '该 Collection 中没有可用接口。')
             return
         self.jv.set(p)
-        self.names['values'] = [r['name'] for r in self.reqs]
-        if self.reqs:
-            self.names.current(0)
+        self.lb.delete(0, 'end')
+        for r in self.reqs:
+            self.lb.insert('end', r['name'])
 
     def _pick_fill(self):
         p = filedialog.askopenfilename(title='选择回填 Excel（可选）',
@@ -1181,12 +1186,9 @@ class PostmanInjectDialog:
         if not self.reqs:
             messagebox.showwarning('缺少接口', '请先选择 Postman Collection。')
             return
-        sel = self.names.get()
-        if not sel:
-            messagebox.showwarning('未选择接口', '请从下拉框选择一个接口。')
-            return
-        req = next((r for r in self.reqs if r['name'] == sel), None)
-        if req is None:
+        sels = list(self.lb.curselection())
+        if not sels:
+            messagebox.showwarning('未选择接口', '请在列表中选择要灌入的接口（可多选）。')
             return
         out = filedialog.asksaveasfilename(title='保存灌入后的文档',
                                            defaultextension='.docx',
@@ -1194,18 +1196,41 @@ class PostmanInjectDialog:
                                            initialfile=os.path.basename(self.doc_path))
         if not out:
             return
-        steps = build_request_steps(req)
-        fill = (self.fill_map or {}).get(sel)
-        try:
-            matched, msg = inject_postman_request(self.doc_path, out, sel, steps, fill=fill)
-        except Exception as e:
-            messagebox.showerror('灌入失败', str(e))
-            return
-        if matched:
-            win.destroy()
-            messagebox.showinfo('灌入成功', msg)
+        ok, skip, miss, errs = [], [], [], []
+        src = self.doc_path
+        for idx in sels:
+            req = self.reqs[idx]
+            sel = req['name']
+            steps = build_request_steps(req)
+            fill = (self.fill_map or {}).get(sel)
+            try:
+                matched, msg = inject_postman_request(src, out, sel, steps, fill=fill)
+            except Exception as e:
+                errs.append('{}：{}'.format(sel, e))
+                continue
+            src = out  # 后续接口基于同一文档继续灌入
+            if matched:
+                if '未重复写入' in msg:
+                    skip.append(sel)
+                else:
+                    ok.append('{} → {}'.format(sel, os.path.basename(out)))
+            else:
+                miss.append('{}：{}'.format(sel, msg))
+        win.destroy()
+        lines = []
+        if ok:
+            lines.append('成功 {} 个：{}'.format(len(ok), '；'.join(ok)))
+        if skip:
+            lines.append('已存在(跳过) {} 个：{}'.format(len(skip), '、'.join(skip)))
+        if miss:
+            lines.append('未匹配 {} 个：{}'.format(len(miss), '；'.join(miss)))
+        if errs:
+            lines.append('出错 {} 个：{}'.format(len(errs), '；'.join(errs)))
+        body = '\n'.join(lines) if lines else '未灌入任何接口。'
+        if miss or errs:
+            messagebox.showwarning('灌入结果', body)
         else:
-            messagebox.showwarning('未匹配', msg)
+            messagebox.showinfo('灌入成功', body + '\n\n保存至：{}'.format(out))
 
 
 class TaskEditDialog:
