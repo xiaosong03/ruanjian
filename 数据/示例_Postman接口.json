@@ -1,0 +1,68 @@
+{
+  "info": {
+    "_postman_id": "4f8a1c01-2b61-4a14-9d9e-abc123456789",
+    "name": "初始化_001",
+    "description": "用于测试“灌入 Postman JSON”功能，含嵌套文件夹与多接口。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "初始化_001",
+      "request": {
+        "method": "GET",
+        "url": "https://api.example.com/config?id=1",
+        "header": [],
+        "body": { "mode": "raw", "raw": "" }
+      }
+    },
+    {
+      "name": "初始化_001",
+      "description": "设备相关的接口都放在这个子文件夹下。",
+      "item": [
+        {
+          "name": "初始化_001",
+          "request": {
+            "method": "POST",
+            "url": "https://api.example.com/user/bulk",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer demo-token" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cmd\": \"set\",\n  \"arg\": [1, 2],\n  \"op\": \"enable\"\n}"
+            }
+          }
+        },
+        {
+          "name": "查询设备列表",
+          "request": {
+            "method": "POST",
+            "url": "https://api.example.com/device/list",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"page\": 1,\n  \"size\": 20,\n  \"filter\": { \"status\": \"online\" }\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "系统维护",
+      "item": [
+        {
+          "name": "设备重启",
+          "request": {
+            "method": "POST",
+            "url": "https://api.example.com/system/reboot",
+            "header": [],
+            "body": { "mode": "raw", "raw": "" }
+          }
+        }
+      ]
+    }
+  ]
+}

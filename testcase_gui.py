@@ -14,9 +14,10 @@ from tkinter import filedialog, messagebox, ttk
 import openpyxl
 
 from testcase_generator import (ALIAS_GROUPS, STEPS_COL_ALIASES,
-                                _json_stream, _key_for_label, generate_document,
-                                get_template_fields, load_template_config,
-                                save_template_config)
+                                _json_stream, _key_for_label, build_request_steps,
+                                generate_document, get_template_fields,
+                                inject_postman_request, load_template_config,
+                                parse_postman_collection, save_template_config)
 
 # 这些语义的字段在界面上用多行输入框，便于填写大段文本
 MULTI_KEYS = {'desc', 'init', 'prereq', 'termination'}
@@ -278,6 +279,44 @@ def load_cases_from_excel(path, field_labels, excel_map=None):
     return cases, warns, headers
 
 
+def _read_fill_excel(path):
+    """读取回填 Excel：列名含"用例名"取名称，含"预期/期望"取预期结果，含"实际"取实际结果。
+    返回 {测试用例名称: {'expected':.., 'actual':..}}（首个同名行生效）。"""
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return {}
+    headers = [str(h).strip() if h is not None else '' for h in rows[0]]
+
+    def find_index(cols):
+        for i, h in enumerate(headers):
+            if h and any(c in h for c in cols):
+                return i
+        return None
+
+    ki = find_index(['用例名称', '用例名'])
+    ei = find_index(['预期', '期望', '希望'])
+    ai = find_index(['实际'])
+    if ki is None:
+        return {}
+    out = {}
+    for r in rows[1:]:
+        if r[ki] is None:
+            continue
+        name = str(r[ki]).strip()
+        if not name:
+            continue
+        d = {}
+        if ei is not None and r[ei] is not None and str(r[ei]).strip():
+            d['expected'] = str(r[ei]).strip()
+        if ai is not None and r[ai] is not None and str(r[ai]).strip():
+            d['actual'] = str(r[ai]).strip()
+        if d:
+            out.setdefault(name, d)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 主界面
 # ---------------------------------------------------------------------------
@@ -318,6 +357,7 @@ class App:
         self.xl_var = tk.StringVar()
         ttk.Entry(frm, textvariable=self.xl_var, width=50).grid(row=3, column=1, sticky='we', **pad)
         ttk.Button(frm, text='浏览…', command=self._pick_xl).grid(row=3, column=2, **pad)
+        ttk.Button(frm, text='灌入 Postman JSON…', command=self._postman_inject).grid(row=3, column=3, **pad)
 
         # ---- 公共步骤：界面写一次，自动插入到每个用例的步骤最前面（列随模板明细列动态生成） ----
         self.csf = ttk.LabelFrame(
@@ -621,6 +661,10 @@ class App:
         if p:
             self.xl_var.set(p)
             self._load_preview()
+
+    def _postman_inject(self):
+        """灌入 Postman JSON：把单个接口信息写入已生成中间 Word 的对应用例步骤格。"""
+        PostmanInjectDialog(self.root, self)
 
     def _pick_out(self):
         p = filedialog.asksaveasfilename(title='保存输出文档', defaultextension='.docx',
@@ -1044,6 +1088,124 @@ class BatchWindow:
         else:
             messagebox.showinfo('批量生成完成',
                                 '全部成功：{} 份文档已生成{}。'.format(ok_n, warn_part))
+
+
+class PostmanInjectDialog:
+    """灌入 Postman JSON（单个接口）：选中间 Word + Collection json，按接口名写入对应用例步骤格。"""
+
+    def __init__(self, root, app):
+        self.app = app
+        self.doc_path = None
+        self.reqs = []
+        self.fill_map = {}
+        self._build(root)
+
+    def _build(self, root):
+        win = tk.Toplevel(root)
+        win.title('灌入 Postman JSON · 单接口')
+        win.geometry('560x300')
+        win.resizable(False, False)
+        win.transient(root)
+        win.grab_set()
+        pad = {'padx': 8, 'pady': 4}
+        frm = ttk.Frame(win, padding=8)
+        frm.pack(fill='both', expand=True)
+
+        ttk.Label(frm, text='中间 Word（已生成、步骤列留空）:').grid(row=0, column=0, sticky='w', **pad)
+        self.dv = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.dv, width=46).grid(row=0, column=1, sticky='we', **pad)
+        ttk.Button(frm, text='浏览…', command=self._pick_doc).grid(row=0, column=2, **pad)
+
+        ttk.Label(frm, text='Postman Collection (*.json):').grid(row=1, column=0, sticky='w', **pad)
+        self.jv = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.jv, width=46).grid(row=1, column=1, sticky='we', **pad)
+        ttk.Button(frm, text='浏览…', command=self._pick_json).grid(row=1, column=2, **pad)
+
+        ttk.Label(frm, text='回填 Excel（可选）:').grid(row=2, column=0, sticky='w', **pad)
+        self.fv = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.fv, width=46).grid(row=2, column=1, sticky='we', **pad)
+        ttk.Button(frm, text='浏览…', command=self._pick_fill).grid(row=2, column=2, **pad)
+        ttk.Label(frm, text='列：测试用例名称 / 预期结果 / 实际结果').grid(row=3, column=1, sticky='w', **pad)
+
+        ttk.Label(frm, text='接口（按名称匹配用例）:').grid(row=4, column=0, sticky='w', **pad)
+        self.names = ttk.Combobox(frm, state='readonly', width=46)
+        self.names.grid(row=4, column=1, sticky='we', **pad)
+        ttk.Label(frm, text='（下拉选择单个接口）').grid(row=4, column=2, sticky='w', **pad)
+
+        btn = ttk.Button(frm, text='灌入所选接口', command=lambda: self._run(win))
+        btn.grid(row=5, column=1, sticky='we', **pad)
+
+        frm.columnconfigure(1, weight=1)
+
+    def _pick_doc(self):
+        p = filedialog.askopenfilename(title='选择中间 Word',
+                                       filetypes=[('Word 文档', '*.docx')])
+        if p:
+            self.doc_path = p
+            self.dv.set(p)
+
+    def _pick_json(self):
+        p = filedialog.askopenfilename(title='选择 Postman Collection',
+                                       filetypes=[('Postman Collection', '*.json'), ('所有文件', '*.*')])
+        if not p:
+            return
+        try:
+            self.reqs = parse_postman_collection(p)
+        except Exception as e:
+            messagebox.showerror('解析失败', '无法解析 Postman Collection：\n{}'.format(e))
+            return
+        if not self.reqs:
+            messagebox.showwarning('未找到接口', '该 Collection 中没有可用接口。')
+            return
+        self.jv.set(p)
+        self.names['values'] = [r['name'] for r in self.reqs]
+        if self.reqs:
+            self.names.current(0)
+
+    def _pick_fill(self):
+        p = filedialog.askopenfilename(title='选择回填 Excel（可选）',
+                                       filetypes=[('Excel 工作簿', '*.xlsx'), ('所有文件', '*.*')])
+        if not p:
+            return
+        try:
+            self.fill_map = _read_fill_excel(p)
+        except Exception as e:
+            messagebox.showerror('读取失败', '无法读取回填 Excel：\n{}'.format(e))
+            return
+        self.fv.set(p)
+
+    def _run(self, win):
+        if not self.doc_path:
+            messagebox.showwarning('缺少文件', '请先选择中间 Word。')
+            return
+        if not self.reqs:
+            messagebox.showwarning('缺少接口', '请先选择 Postman Collection。')
+            return
+        sel = self.names.get()
+        if not sel:
+            messagebox.showwarning('未选择接口', '请从下拉框选择一个接口。')
+            return
+        req = next((r for r in self.reqs if r['name'] == sel), None)
+        if req is None:
+            return
+        out = filedialog.asksaveasfilename(title='保存灌入后的文档',
+                                           defaultextension='.docx',
+                                           filetypes=[('Word 文档', '*.docx')],
+                                           initialfile=os.path.basename(self.doc_path))
+        if not out:
+            return
+        steps = build_request_steps(req)
+        fill = (self.fill_map or {}).get(sel)
+        try:
+            matched, msg = inject_postman_request(self.doc_path, out, sel, steps, fill=fill)
+        except Exception as e:
+            messagebox.showerror('灌入失败', str(e))
+            return
+        if matched:
+            win.destroy()
+            messagebox.showinfo('灌入成功', msg)
+        else:
+            messagebox.showwarning('未匹配', msg)
 
 
 class TaskEditDialog:

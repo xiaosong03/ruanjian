@@ -767,6 +767,230 @@ def generate_document(output_path, cases, template_source=None, h3_title='功能
 
 
 # ---------------------------------------------------------------------------
+# Postman Collection 导入（单接口：灌入已生成的中问 Word）
+# ---------------------------------------------------------------------------
+def _flatten_items(items, out):
+    """把 Postman Collection 的 items 递归展平为接口列表（支持嵌套文件夹）。"""
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        if it.get('request'):
+            out.append(it)
+        if isinstance(it.get('item'), list):
+            _flatten_items(it['item'], out)
+
+
+def parse_postman_collection(path):
+    """解析 Postman Collection(.json)，返回接口列表 [{name, method, url, headers, body}]。
+    name 取自 item['name']。请求体优先取 raw(多为 JSON)。"""
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    items = []
+    if isinstance(data, dict):
+        _flatten_items(data.get('item') or [], items)
+    reqs = []
+    for it in items:
+        req = it.get('request') or {}
+        body = ''
+        b = req.get('body') or {}
+        raw = b.get('raw')
+        if isinstance(raw, str):
+            body = raw
+        headers = []
+        for h in (req.get('header') or []):
+            if isinstance(h, dict) and h.get('key'):
+                headers.append('{}: {}'.format(h.get('key'), h.get('value', '')))
+        reqs.append({
+            'name': str(it.get('name', '')).strip(),
+            'method': str(req.get('method', '')).strip().upper(),
+            'url': _req_url(req.get('url')),
+            'headers': headers,
+            'body': body,
+        })
+    return reqs
+
+
+def _req_url(url):
+    """URL 可能是字符串或结构体(url.raw 存在)，统一取字符串。"""
+    if isinstance(url, str):
+        return url
+    if isinstance(url, dict):
+        return url.get('raw') or url.get('path') or ''
+    return str(url)
+
+
+def build_request_steps(req):
+    """把单个接口信息拼成一段"测试步骤"文本（含方法/URL/请求头/请求体）。
+    请求体若为大段 JSON 则原样整段保留，便于后续原子写入 Word 单元格。"""
+    lines = []
+    url = req.get('url', '')
+    method = req.get('method', '') or 'GET'
+    lines.append('请求：{} {}'.format(method, url if url else '（未提供 URL）'))
+    for h in req.get('headers') or []:
+        lines.append(h)
+    body = (req.get('body') or '').strip()
+    if body:
+        if lines and not lines[-1].startswith('请求体'):
+            lines.append('请求体：')
+        lines.append(body)
+    return '\n'.join(lines)
+
+
+def inject_postman_request(doc_path, out_path, name, steps_block, config=None, fill=None):
+    """在已生成的中间 Word 中，把 steps_block 灌入"测试用例名称==name"那张表的步骤格。
+    steps_block 作为单个步骤行追加写入（请求体大 JSON 整段进一格）。
+    fill 可选：{expected/actual: 文本}，写入刚注入那一行对应列。
+    返回 (matched, msg)。"""
+    from docx import Document as _D
+    doc = _D(doc_path)
+    matched = None
+    for tbl in doc.tables:
+        info = analyze_fields(tbl._tbl)
+        name_field = next((f for f in info.get('fields', []) if f.get('key') == 'name'), None)
+        if name_field is None:
+            continue
+        if _tc_text(name_field['tc']).strip() != name:
+            continue
+        matched = tbl._tbl
+        status = _inject_req_row(matched, info, steps_block, config, fill)
+        matched = (status, matched)
+        break
+    if matched is None:
+        return False, '在文档中未找到用例名称为“{}”的表格，未做任何灌入。'.format(name)
+    status, _ = matched
+    doc.save(out_path)
+    if status == 'exists':
+        return True, '接口“{}”已存在于步骤列末尾，未重复写入。'.format(name)
+    return True, '已将接口“{}”写入 → {}'.format(name, os.path.basename(out_path))
+
+
+def _inject_one_step(tbl, header_tr, anchor_tr, pattern_tr, colmap, seq_num, steps_block):
+    """在明细区末尾追加一个步骤行，仅填序号与步骤列（不动期望/实际/准则等已有内容）。"""
+    new_tr = copy.deepcopy(pattern_tr)
+    anchor_tr.addprevious(new_tr)
+    tcs = _tr_tcs(new_tr)
+    for tc in tcs:
+        _set_tc_text(tc, '')
+
+    def cell(role):
+        ci = colmap.get(role)
+        return tcs[ci] if ci is not None and 0 <= ci < len(tcs) else None
+
+    c = cell('seq')
+    if c is None and tcs:
+        c = tcs[0]
+    if c is not None:
+        _set_tc_text(c, str(seq_num))
+    c = cell('step')
+    if c is not None:
+        _put_tc(c, steps_block)
+    return new_tr
+
+
+def _fill_detail_cells(tr, colmap, fill):
+    """把 {expected/actual: 文本} 写入某一明细行对应列（无则该列跳过）。"""
+    tcs = _tr_tcs(tr)
+
+    def cell(role):
+        ci = colmap.get(role)
+        return tcs[ci] if ci is not None and 0 <= ci < len(tcs) else None
+
+    for role in ('expected', 'actual'):
+        if fill.get(role) in (None, ''):
+            continue
+        c = cell(role)
+        if c is not None:
+            _put_tc(c, _prettify_json(str(fill[role])))
+
+
+def _inject_req_row(tbl, info, steps_block, config, fill=None):
+    """把接口请求追加为一个新步骤行（不清除已有明细行，不动其他已有行内容）。
+    仅填序号与步骤列；可选把 expected/actual 写入该行；重复内容自动去重。
+    返回 'ok' / 'exists'。"""
+    steps = info['steps']
+    header_tr = steps.get('header_tr')
+    if header_tr is None:
+        return 'ok'
+    anchor_tr = steps.get('anchor_tr')
+    if anchor_tr is None:
+        anchor_tr = trs_last(tbl)
+    pattern_tr = steps.get('pattern_tr')
+    if pattern_tr is None:
+        pattern_tr = header_tr
+    colmap = _resolve_detail_cols(steps, config)
+    step_col = colmap.get('step')
+    seq_col = colmap.get('seq')
+
+    # 读取现有明细行（表头与锚点之间），含"公共步骤(有步骤内容)"与"Excel 占位行/空步骤行"
+    detail_trs = []
+    tr = header_tr.getnext()
+    while tr is not None and tr is not anchor_tr:
+        detail_trs.append(tr)
+        tr = tr.getnext()
+
+    def tr_step(tr):
+        tcs = _tr_tcs(tr)
+        if step_col is not None and step_col < len(tcs):
+            return _tc_text(tcs[step_col]).strip()
+        return ''
+
+    def row_empty(tr):
+        return not any(_tc_text(tc).strip() for tc in _tr_tcs(tr))
+
+    # 去重：若某行步骤已是该请求，视为已灌入过
+    for tr in detail_trs:
+        s = tr_step(tr)
+        if s and ''.join(s.split()) == ''.join(steps_block.split()):
+            if fill:
+                _fill_detail_cells(tr, colmap, fill)
+            return 'exists'
+
+    # 找"没有操作步骤"的行（步骤列为空，且不是全空白行），优先填补它，不改动有步骤内容的公共步骤
+    target = None
+    for tr in detail_trs:
+        if row_empty(tr):
+            continue
+        if not tr_step(tr):
+            target = tr
+            break
+
+    if target is None:
+        # 没有可填补的空步骤行：末尾追加一行（公共步骤完全保留）
+        cnt = sum(1 for tr in detail_trs if not row_empty(tr)) + 1
+        target = _inject_one_step(tbl, header_tr, anchor_tr, pattern_tr, colmap, cnt, steps_block)
+    else:
+        # 直接补进那一行的步骤列（不删除任何行、不动公共步骤）
+        tcs = _tr_tcs(target)
+        c = tcs[step_col] if (step_col is not None and step_col < len(tcs)) else tcs[0]
+        _put_tc(c, steps_block)
+        if fill:
+            _fill_detail_cells(target, colmap, fill)
+
+    # 仅移除"完全空白"的冗余占位行（不影响任何有内容的行）
+    for tr in list(detail_trs):
+        if tr is target or not row_empty(tr):
+            continue
+        pr = tr.getparent()
+        if pr is not None:
+            pr.remove(tr)
+
+    # 统一重排明细序号（公共步骤 + 补入行按顺序编号）
+    n = 0
+    tr = header_tr.getnext()
+    while tr is not None and tr is not anchor_tr:
+        if row_empty(tr):
+            tr = tr.getnext()
+            continue
+        n += 1
+        tcs = _tr_tcs(tr)
+        c = tcs[seq_col] if (seq_col is not None and seq_col < len(tcs)) else tcs[0]
+        if c is not None:
+            _set_tc_text(c, str(n))
+        tr = tr.getnext()
+    return 'ok'
+
+
+# ---------------------------------------------------------------------------
 # 独立运行/调试入口
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
